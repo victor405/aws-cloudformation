@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "cloud-formation"
+Parameters:
+  subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  vpcids:
+    Type: List<AWS::EC2::VPC::Id>
+  monitoringemail:
+    Type: String
+Resources:
+  # Networking
+  SGOpenToLB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Load Balancer SG (SGOpenTOInternet) to EC2 Instnace traffic."
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        SourceSecurityGroupId: !GetAtt SGOpenToInternet.GroupId
+        FromPort: '80'
+        ToPort: '80'
+      - IpProtocol: tcp
+        SourceSecurityGroupId: !GetAtt SGOpenToInternet.GroupId
+        FromPort: '443'
+        ToPort: '443'
+  SGOpenToInternet:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Internet (via ports 80/443) to Load Balancer"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        CidrIp: 0.0.0.0/0
+        FromPort: '80'
+        ToPort: '80'
+      - IpProtocol: tcp
+        CidrIp: 0.0.0.0/0
+        FromPort: '443'
+        ToPort: '443'
+
+  # IAM
+  RootRole: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+        -
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ec2.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+  RolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "root"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Action: "*"
+            Resource: "*"
+      Roles: 
+      - !Ref RootRole
+  RootInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+      - !Ref RootRole
+
+  # Monitoring
+  MonitoringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Monitoring
+      Subscription:
+        - Endpoint: !Ref monitoringemail
+          Protocol: email
+  MonitoringSNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref MonitoringTopic
+      PolicyDocument:
+        Version: 2008-10-17
+        Id: __default_policy_ID
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'SNS:GetTopicAttributes'
+              - 'SNS:SetTopicAttributes'
+              - 'SNS:AddPermission'
+              - 'SNS:RemovePermission'
+              - 'SNS:DeleteTopic'
+              - 'SNS:Subscribe'
+              - 'SNS:ListSubscriptionsByTopic'
+              - 'SNS:Publish'
+              - 'SNS:Receive'
+            Resource: !Ref MonitoringTopic
+
+  # Load Balancing (Includes HA)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+      - !GetAtt SGOpenToInternet.GroupId
+      Subnets: !Ref subnets
+  LBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: 
+    - LoadBalancer
+    Properties:
+      TargetType: "instance"
+      Protocol: HTTP
+      Port: 80
+      HealthCheckPath: "/healthy.txt"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::Join:
+          - ""
+          - !Ref vpcids
+
+  # Auto Scaling (Includes HA, IIS, Website)
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-00cb4c0d60b9476f4
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref RootInstanceProfile
+      SecurityGroups:
+      - !Ref SGOpenToLB
+      UserData:
+        'Fn::Base64': !Sub |
+          <powershell>
+          Import-Module ServerManager
+          Install-WindowsFeature web-server, web-webserver
+          Install-WindowsFeature web-mgmt-tools
+
+          New-Item -Path 'c:\' -Name 'temp' -ItemType directory
+          #curl -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "c:/temp/AWSCLIV2.msi"
+          #iex "c:/temp/AWSCLIV2.msi /quiet InstallAllUsers=0 PrependPath=1 Include_test=0"
+          #while ((gci -Path 'C:\Program Files' -Recurse | ?{ $_.name -like "*aws.exe" }).fullname -eq $false) {}
+          #$aws = (gci -Path 'C:\Program Files' -Recurse | ?{ $_.name -like "*aws.exe" }).fullname
+          #& $aws configure set region us-east-1
+
+          # $SSM = "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/windows_amd64/AmazonSSMAgentSetup.exe"
+          # curl -Uri $SSM -OutFile 'c:\temp\SSMAgent_latest.exe'
+          # Start-Process 'c:\temp\SSMAgent_latest.exe' -ArgumentList "/S"
+
+          Get-ChildItem 'C:\inetpub\wwwroot' | %{ Remove-Item $_.fullname -Confirm:$false -Force }
+          
+          $healthCheck = "Healthy"
+          $healthCheck > "C:\inetpub\wwwroot\healthy.txt"
+          
+          $html = '<!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+
+
+              <title>title</title>
+              <meta name="author" content="Victor Mendoza">
+              
+              <script>
+                function fillHTML() {
+                  var text = document.getElementById("userinput").value;
+                  document.getElementById("useroutput").innerHTML = text;
+                }
+              </script>
+              
+              <style>
+                * {
+                  Text-Decoration: none;
+                  margin: 0;
+                  padding: 0;
+                }
+                html, body {
+                  height: 100%;
+                }
+                body {
+                  display: flex;
+                  flex-direction: column;
+                  background-color: white;
+                  text-align: center;
+                }
+                .content {
+                  flex: 1 0 auto;
+                  margin: 100px 0 0 0;
+                  text-align: center;
+                }
+                header {
+                  background-color: #1E90FF;
+                  overflow: hidden;
+                  width: 100%;
+                  height: 60px;
+                  position: fixed;
+                  padding: 30px 0 0 20px;
+                  top: 0;
+                  left: 0;
+                  text-align: left!important;
+                  color: white;
+                  font: 1.6em bold;
+                }
+                main {
+                  flex: 1;
+                }
+                input {
+                  width:70%;
+                  height:30px;
+                }
+                button {
+                  height: 30px;
+                  color: white;
+                  font-weight: bold;
+                  background-color: #34495E;
+                  border: 2px solid black;
+                  padding: 2px;
+                }
+                button:hover {
+                  cursor: pointer;
+                  color: black;
+                  background-color: white;
+                  border: 2px solid #34495E;
+                }
+                #useroutput
+                {
+                  display: inline-block;
+                  margin: 30px 0 0 0;
+                  width: 70%;
+                  background-color: #ECF0F1;
+                  height: 400px;
+                  box-shadow: 7px 9px 9px 0px rgba(214,214,214,1);
+                  font: 2em solid;
+                }
+                footer {
+                  flex-shrink: 0;
+                  width: 100%;
+                  background-color: #273746;
+                  height: 50px;
+                  color: white;
+                  font: 1.1em bold;
+                  padding: 30px 0 0 0;
+                }
+              </style>
+            </head>
+
+            <body>
+              <header>
+                Test
+              </header>
+
+              <div class="content">
+                <main>
+                  <input type="text" id="userinput" name="userinput" placeholder="Enter Text Here">
+                  <button onclick="fillHTML();">Submit</button>
+                  <div id="useroutput"></div>
+                  <br><br><br>
+                  <center>
+                  </center>
+                </main>
+              </div>
+              <footer>
+                Copyright 2020
+              </footer>
+            </body>
+          </html>'
+
+          $html > "C:\inetpub\wwwroot\index.html"
+
+          </powershell>
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones:
+        'Fn::GetAZs': ""
+      DesiredCapacity: 2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MaxSize: 2
+      MinSize: 2
+      TargetGroupARNs:
+      - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: EC2
+          PropagateAtLaunch: true
+      NotificationConfigurations:
+        - TopicARN: !Ref MonitoringTopic
+          NotificationTypes:
+            - 'autoscaling:EC2_INSTANCE_LAUNCH'
+            - 'autoscaling:EC2_INSTANCE_LAUNCH_ERROR'
+            - 'autoscaling:EC2_INSTANCE_TERMINATE'
+            - 'autoscaling:EC2_INSTANCE_TERMINATE_ERROR'
+
+  # Development Platform
+  CodeRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: CodeRepo
+      RepositoryDescription: "Development Repo for git and version control."
